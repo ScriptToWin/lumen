@@ -1,0 +1,10 @@
+[package]
+name = "lumen"
+version = "0.1.1"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+rodio = "0.19"
+id3 = "1.14"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
