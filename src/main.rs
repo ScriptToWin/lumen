@@ -3,12 +3,14 @@ use eframe::egui::{
     TextureOptions, Vec2,
 };
 use id3::TagLike;
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+use rodio::buffer::SamplesBuffer;
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 type PathList = Vec<PathBuf>;
 type FavoriteSet = BTreeSet<PathBuf>;
@@ -47,6 +49,7 @@ struct Track {
     path: PathBuf,
     accent_color: Color32,
     cover: Option<TextureHandle>,
+    duration: Option<Duration>,
 }
 
 struct LumenApp {
@@ -64,6 +67,15 @@ struct LumenApp {
     volume: f32,
     music_dir: PathBuf,
     status_message: String,
+
+    // Audio Decoding & Seeking State
+    current_samples: Vec<f32>,
+    sample_rate: u32,
+    channels: u16,
+    playback_position: f32,
+    track_duration: f32,
+    playback_start_instant: Option<Instant>,
+
     _stream: OutputStream,
     stream_handle: OutputStreamHandle,
     sink: Option<Sink>,
@@ -80,13 +92,10 @@ impl LumenApp {
         let music_dir = Self::resolve_music_dir();
         let (tracks, folder_playlists) = Self::scan_music_folder(&music_dir, &cc.egui_ctx);
 
-        let mut custom_playlists = CustomPlaylistMap::new();
-        custom_playlists.insert(String::from("Chill Mix"), PathList::new());
-
-        Self {
+        let mut app = Self {
             tracks,
             folder_playlists,
-            custom_playlists,
+            custom_playlists: CustomPlaylistMap::new(),
             new_playlist_name: String::new(),
             favorites: FavoriteSet::new(),
             active_tab: ActiveTab::AllSongs,
@@ -98,9 +107,79 @@ impl LumenApp {
             volume: 0.75,
             music_dir,
             status_message: String::new(),
+            current_samples: Vec::new(),
+            sample_rate: 44100,
+            channels: 2,
+            playback_position: 0.0,
+            track_duration: 0.0,
+            playback_start_instant: None,
             _stream,
             stream_handle,
             sink: None,
+        };
+
+        app.load_state();
+        if app.custom_playlists.is_empty() {
+            app.custom_playlists.insert(String::from("Chill Mix"), PathList::new());
+        }
+
+        app
+    }
+
+    fn config_dir(&self) -> PathBuf {
+        let dir = self.music_dir.join(".lumen");
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    fn save_state(&self) {
+        let dir = self.config_dir();
+        let fav_path = dir.join("favorites.txt");
+        let fav_content = self.favorites.iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let _ = fs::write(fav_path, fav_content);
+
+        let pl_path = dir.join("playlists.txt");
+        let mut pl_content = String::new();
+        for (name, paths) in &self.custom_playlists {
+            pl_content.push_str(&format!("[{}]\n", name));
+            for p in paths {
+                pl_content.push_str(&format!("{}\n", p.to_string_lossy()));
+            }
+        }
+        let _ = fs::write(pl_path, pl_content);
+    }
+
+    fn load_state(&mut self) {
+        let dir = self.config_dir();
+        let fav_path = dir.join("favorites.txt");
+        if let Ok(content) = fs::read_to_string(fav_path) {
+            for line in content.lines() {
+                let p = PathBuf::from(line.trim());
+                if !p.as_os_str().is_empty() && p.exists() {
+                    self.favorites.insert(p);
+                }
+            }
+        }
+
+        let pl_path = dir.join("playlists.txt");
+        if let Ok(content) = fs::read_to_string(pl_path) {
+            let mut current_pl = None;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.starts_with('[') && line.ends_with(']') {
+                    let name = &line[1..line.len() - 1];
+                    current_pl = Some(name.to_string());
+                    self.custom_playlists.entry(name.to_string()).or_default();
+                } else if let Some(ref pl) = current_pl {
+                    if !line.is_empty() {
+                        let p = PathBuf::from(line);
+                        self.custom_playlists.entry(pl.clone()).or_default().push(p);
+                    }
+                }
+            }
         }
     }
 
@@ -168,9 +247,7 @@ impl LumenApp {
             &["inter-regular", "notosans-regular", "notosans[wght]", "cantarell", "liberationsans-regular"],
         ) {
             if let Ok(data) = fs::read(ui_path) {
-                fonts
-                .font_data
-                .insert("system_ui".to_owned(), egui::FontData::from_owned(data));
+                fonts.font_data.insert("system_ui".to_owned(), egui::FontData::from_owned(data));
                 fonts
                 .families
                 .entry(egui::FontFamily::Proportional)
@@ -184,9 +261,7 @@ impl LumenApp {
             &["notosanscjk", "notosansjp", "vlgothic", "ipag", "droidsansfallback", "wqy"],
         ) {
             if let Ok(data) = fs::read(cjk_path) {
-                fonts
-                .font_data
-                .insert("system_cjk".to_owned(), egui::FontData::from_owned(data));
+                fonts.font_data.insert("system_cjk".to_owned(), egui::FontData::from_owned(data));
                 fonts
                 .families
                 .entry(egui::FontFamily::Proportional)
@@ -200,9 +275,7 @@ impl LumenApp {
             &["notosanssymbols2", "notosanssymbols", "dejavusans.ttf", "freesans.ttf"],
         ) {
             if let Ok(data) = fs::read(sym_path) {
-                fonts
-                .font_data
-                .insert("system_symbols".to_owned(), egui::FontData::from_owned(data));
+                fonts.font_data.insert("system_symbols".to_owned(), egui::FontData::from_owned(data));
                 fonts
                 .families
                 .entry(egui::FontFamily::Proportional)
@@ -297,8 +370,7 @@ impl LumenApp {
                                         if let Ok(dyn_img) = image::load_from_memory(&pic.data) {
                                             let thumb = dyn_img.thumbnail(256, 256);
                                             let rgba = thumb.to_rgba8();
-                                            let size =
-                                            [rgba.width() as usize, rgba.height() as usize];
+                                            let size = [rgba.width() as usize, rgba.height() as usize];
                                             let color_img = ColorImage::from_rgba_unmultiplied(
                                                 size,
                                                 rgba.as_flat_samples().as_slice(),
@@ -332,6 +404,7 @@ impl LumenApp {
                                         path,
                                         accent_color: palette[color_idx],
                                         cover,
+                                        duration: None,
                             });
                         }
                     }
@@ -339,6 +412,7 @@ impl LumenApp {
             }
         }
     }
+
     fn clear_ram_cache(&mut self, ctx: &egui::Context) {
         let mut freed_count = 0;
         for (idx, track) in self.tracks.iter_mut().enumerate() {
@@ -357,48 +431,85 @@ impl LumenApp {
         });
         self.status_message = match self.language {
             Language::English => format!("Cleared {} cached covers & trimmed memory.", freed_count),
-            Language::German => format!(
-                "{} Cover-Texturen entfernt & RAM bereinigt.",
-                freed_count
-            ),
+            Language::German => format!("{} Cover-Texturen entfernt & RAM bereinigt.", freed_count),
             Language::Japanese => format!("{}個のカバーキャッシュを削除しました。", freed_count),
             Language::Spanish => format!("Se liberaron {} portadas en caché.", freed_count),
             Language::French => format!("{} pochettes libérées du cache.", freed_count),
         };
     }
-    fn play_track(&mut self, index: usize) {
+
+    fn play_track_from_position(&mut self, index: usize, start_secs: f32) {
         if index >= self.tracks.len() {
             return;
         }
+
         if let Some(old_sink) = self.sink.take() {
             old_sink.stop();
         }
-        if let Ok(file) = File::open(&self.tracks[index].path) {
-            if let Ok(source) = Decoder::new(BufReader::new(file)) {
-                if let Ok(new_sink) = Sink::try_new(&self.stream_handle) {
-                    new_sink.set_volume(self.perceived_volume());
-                    new_sink.append(source);
-                    new_sink.play();
-                    self.sink = Some(new_sink);
-                    self.current_track = Some(index);
-                    self.is_playing = true;
+
+        let track_path = self.tracks[index].path.clone();
+
+        if self.current_track != Some(index) || self.current_samples.is_empty() {
+            if let Ok(file) = File::open(&track_path) {
+                if let Ok(decoder) = Decoder::new(BufReader::new(file)) {
+                    self.sample_rate = decoder.sample_rate();
+                    self.channels = decoder.channels();
+                    // FIX: Convert samples to f32 so collect() works with Vec<f32>
+                    self.current_samples = decoder.convert_samples::<f32>().collect();
+
+                    if self.sample_rate > 0 && self.channels > 0 {
+                        self.track_duration = self.current_samples.len() as f32
+                        / (self.sample_rate as f32 * self.channels as f32);
+                    } else {
+                        self.track_duration = 0.0;
+                    }
+                    self.tracks[index].duration = Some(Duration::from_secs_f32(self.track_duration));
                 }
             }
         }
+
+        let total_channels = self.channels as usize;
+        let sample_offset = (start_secs * self.sample_rate as f32 * total_channels as f32) as usize;
+        let sample_offset = sample_offset - (sample_offset % total_channels.max(1));
+        let sample_offset = sample_offset.min(self.current_samples.len());
+
+        let slice = self.current_samples[sample_offset..].to_vec();
+        let source = SamplesBuffer::new(self.channels, self.sample_rate, slice);
+
+        if let Ok(new_sink) = Sink::try_new(&self.stream_handle) {
+            new_sink.set_volume(self.perceived_volume());
+            new_sink.append(source);
+            new_sink.play();
+            self.sink = Some(new_sink);
+            self.current_track = Some(index);
+            self.is_playing = true;
+            self.playback_position = start_secs;
+            self.playback_start_instant = Some(Instant::now());
+        }
     }
+
+    fn play_track(&mut self, index: usize) {
+        self.play_track_from_position(index, 0.0);
+    }
+
     fn toggle_play_pause(&mut self) {
         if let Some(sink) = &self.sink {
             if self.is_playing {
                 sink.pause();
                 self.is_playing = false;
+                if let Some(start) = self.playback_start_instant.take() {
+                    self.playback_position += start.elapsed().as_secs_f32();
+                }
             } else {
                 sink.play();
                 self.is_playing = true;
+                self.playback_start_instant = Some(Instant::now());
             }
         } else if !self.tracks.is_empty() {
             self.play_track(0);
         }
     }
+
     fn handle_track_finished(&mut self) {
         if self.tracks.is_empty() {
             self.is_playing = false;
@@ -419,11 +530,13 @@ impl LumenApp {
                         self.play_track(idx + 1);
                     } else {
                         self.is_playing = false;
+                        self.playback_position = self.track_duration;
                     }
                 }
             }
         }
     }
+
     fn next_track(&mut self) {
         if self.tracks.is_empty() {
             return;
@@ -434,6 +547,7 @@ impl LumenApp {
         };
         self.play_track(next);
     }
+
     fn prev_track(&mut self) {
         if self.tracks.is_empty() {
             return;
@@ -444,6 +558,14 @@ impl LumenApp {
         };
         self.play_track(prev);
     }
+
+    fn format_time(secs: f32) -> String {
+        let total_secs = secs.max(0.0) as u64;
+        let mins = total_secs / 60;
+        let s = total_secs % 60;
+        format!("{:02}:{:02}", mins, s)
+    }
+
     fn draw_artwork(
         ui: &mut egui::Ui,
         size: f32,
@@ -484,16 +606,24 @@ impl LumenApp {
         }
     }
 }
+
 impl eframe::App for LumenApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.is_playing {
+            if let Some(start) = self.playback_start_instant {
+                let current_pos = self.playback_position + start.elapsed().as_secs_f32();
+                if current_pos >= self.track_duration && self.track_duration > 0.0 {
+                    self.handle_track_finished();
+                }
+            }
             if let Some(sink) = &self.sink {
                 if sink.empty() {
                     self.handle_track_finished();
                 }
             }
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
+
         // 1. LEFT SIDEBAR
         egui::SidePanel::left("sidebar_nav")
         .exact_width(210.0)
@@ -609,6 +739,7 @@ impl eframe::App for LumenApp {
                         if !trimmed.is_empty() {
                             self.custom_playlists.entry(trimmed).or_default();
                             self.new_playlist_name.clear();
+                            self.save_state();
                         }
                     }
             });
@@ -719,6 +850,7 @@ impl eframe::App for LumenApp {
                 }
             });
         });
+
         // 2. RIGHT SIDEBAR
         egui::SidePanel::right("now_playing_panel")
         .exact_width(250.0)
@@ -816,10 +948,36 @@ impl eframe::App for LumenApp {
                         .color(Color32::from_rgb(174, 174, 178)),
                     );
                 }
-                ui.add_space(22.0);
+                ui.add_space(16.0);
+
+                // --- SEEKING / PROGRESS SLIDER ---
+                let mut current_pos = self.playback_position;
+                if self.is_playing {
+                    if let Some(start) = self.playback_start_instant {
+                        current_pos = self.playback_position + start.elapsed().as_secs_f32();
+                    }
+                }
+                current_pos = current_pos.clamp(0.0, self.track_duration.max(0.01));
+
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(Self::format_time(current_pos)).size(11.0).color(Color32::from_rgb(134, 134, 139)));
+                    let slider = egui::Slider::new(&mut current_pos, 0.0..=self.track_duration.max(0.01))
+                    .show_value(false)
+                    .trailing_fill(true);
+                    let slider_response = ui.add_sized(Vec2::new(125.0, 14.0), slider);
+                    ui.label(RichText::new(Self::format_time(self.track_duration)).size(11.0).color(Color32::from_rgb(134, 134, 139)));
+
+                    if slider_response.drag_stopped() || slider_response.clicked() {
+                        if let Some(idx) = self.current_track {
+                            self.play_track_from_position(idx, current_pos);
+                        }
+                    }
+                });
+
+                ui.add_space(14.0);
                 // Transport Controls
                 ui.allocate_ui_with_layout(
-                    Vec2::new(160.0, 50.0),
+                    Vec2::new(160.0, 40.0),
                                            egui::Layout::left_to_right(egui::Align::Center),
                                            |ui| {
                                                if ui
@@ -856,7 +1014,7 @@ impl eframe::App for LumenApp {
                                                    }
                                            },
                 );
-                ui.add_space(14.0);
+                ui.add_space(10.0);
                 // Repeat Button
                 let (repeat_label, repeat_active) = match self.repeat_mode {
                     RepeatMode::Off => (
@@ -912,7 +1070,7 @@ impl eframe::App for LumenApp {
                             RepeatMode::One => RepeatMode::Off,
                         };
                     }
-                    ui.add_space(18.0);
+                    ui.add_space(14.0);
                     // Volume Bar
                     ui.allocate_ui_with_layout(
                         Vec2::new(195.0, 24.0),
@@ -932,6 +1090,7 @@ impl eframe::App for LumenApp {
                     );
             });
         });
+
         // 3. CENTER PANEL
         egui::CentralPanel::default()
         .frame(
@@ -976,50 +1135,35 @@ impl eframe::App for LumenApp {
                         ui.add_space(8.0);
                         ui.horizontal_wrapped(|ui| {
                             if ui
-                                .selectable_label(
-                                    self.language == Language::English,
-                                    "English",
-                                )
+                                .selectable_label(self.language == Language::English, "English")
                                 .clicked()
                                 {
                                     self.language = Language::English;
                                 }
                                 ui.add_space(8.0);
                             if ui
-                                .selectable_label(
-                                    self.language == Language::German,
-                                    "Deutsch",
-                                )
+                                .selectable_label(self.language == Language::German, "Deutsch")
                                 .clicked()
                                 {
                                     self.language = Language::German;
                                 }
                                 ui.add_space(8.0);
                             if ui
-                                .selectable_label(
-                                    self.language == Language::Japanese,
-                                    "日本語",
-                                )
+                                .selectable_label(self.language == Language::Japanese, "日本語")
                                 .clicked()
                                 {
                                     self.language = Language::Japanese;
                                 }
                                 ui.add_space(8.0);
                             if ui
-                                .selectable_label(
-                                    self.language == Language::Spanish,
-                                    "Español",
-                                )
+                                .selectable_label(self.language == Language::Spanish, "Español")
                                 .clicked()
                                 {
                                     self.language = Language::Spanish;
                                 }
                                 ui.add_space(8.0);
                             if ui
-                                .selectable_label(
-                                    self.language == Language::French,
-                                    "Français",
-                                )
+                                .selectable_label(self.language == Language::French, "Français")
                                 .clicked()
                                 {
                                     self.language = Language::French;
@@ -1115,6 +1259,21 @@ impl eframe::App for LumenApp {
                             .size(13.0)
                             .color(Color32::from_rgb(134, 134, 139)),
                         );
+                        ui.add_space(8.0);
+                        if ui.button(self.tr(
+                            "📂 Open Music Folder",
+                            "📂 Musikordner öffnen",
+                            "📂 音楽フォルダを開く",
+                            "📂 Abrir carpeta de música",
+                            "📂 Ouvrir le dossier musique",
+                        )).clicked() {
+                            #[cfg(target_os = "windows")]
+                            let _ = std::process::Command::new("explorer").arg(&self.music_dir).spawn();
+                            #[cfg(target_os = "macos")]
+                            let _ = std::process::Command::new("open").arg(&self.music_dir).spawn();
+                            #[cfg(target_os = "linux")]
+                            let _ = std::process::Command::new("xdg-open").arg(&self.music_dir).spawn();
+                        }
                     });
                     ui.add_space(14.0);
                     egui::Frame::none()
@@ -1147,12 +1306,13 @@ impl eframe::App for LumenApp {
                             .size(13.5)
                             .strong()
                             .color(Color32::from_rgb(250, 45, 72)),
-                                        "youtube.com",
+                                        "https://www.youtube.com/@CeyroVT",
                         );
                     });
                 });
                 return;
             }
+
             // Header für Songliste
             let heading = match &self.active_tab {
                 ActiveTab::AllSongs => self
@@ -1242,6 +1402,7 @@ impl eframe::App for LumenApp {
             });
             if let Some(pl_del) = delete_custom_pl {
                 self.custom_playlists.remove(&pl_del);
+                self.save_state();
                 self.active_tab = ActiveTab::AllSongs;
                 return;
             }
@@ -1268,7 +1429,7 @@ impl eframe::App for LumenApp {
                 for (idx, t) in self.tracks.iter().enumerate() {
                     let tab_match = match &self.active_tab {
                         ActiveTab::AllSongs => true,
-              ActiveTab::Favorites => self.favorites.contains(&t.path),
+                        ActiveTab::Favorites => self.favorites.contains(&t.path),
               ActiveTab::FolderPlaylist(pl) => &t.folder_playlist == pl,
               _ => false,
                     };
@@ -1466,19 +1627,24 @@ impl eframe::App for LumenApp {
                 if let Some((pl_name, path)) = add_to_playlist_action {
                     if let Some(list) = self.custom_playlists.get_mut(&pl_name) {
                         list.push(path);
+                        self.save_state();
                     }
                 } else if let Some(pos) = remove_from_playlist_pos {
                     if let ActiveTab::CustomPlaylist(pl_name) = &self.active_tab {
                         if let Some(list) = self.custom_playlists.get_mut(pl_name) {
                             if pos < list.len() {
                                 list.remove(pos);
+                                self.save_state();
                             }
                         }
                     }
                 } else if let Some(p) = toggle_fav_path {
-                    if !self.favorites.remove(&p) {
+                    if self.favorites.contains(&p) {
+                        self.favorites.remove(&p);
+                    } else {
                         self.favorites.insert(p);
                     }
+                    self.save_state();
                 } else if let Some(idx) = clicked_index {
                     self.play_track(idx);
                 }
@@ -1486,6 +1652,7 @@ impl eframe::App for LumenApp {
         });
     }
 }
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
